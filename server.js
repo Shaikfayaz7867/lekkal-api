@@ -1,85 +1,89 @@
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const { Pool } = require('pg');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const path = require('path');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || 'lekkal_secret_secure_key_1234!';
+const DATABASE_URL = process.env.DATABASE_URL;
+
+if (!DATABASE_URL) {
+  console.error('CRITICAL: DATABASE_URL environment variable is not defined.');
+  process.exit(1);
+}
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// Initialize SQLite Database
-const dbPath = path.resolve(__dirname, 'lekkal_backup.db');
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error('Database connection error:', err.message);
-  } else {
-    console.log('Connected to the SQLite database: lekkal_backup.db');
-    createTables();
-  }
+// Connection Pool Settings
+const isProduction = process.env.NODE_ENV === 'production' || (!DATABASE_URL.includes('localhost') && !DATABASE_URL.includes('127.0.0.1'));
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: isProduction ? { rejectUnauthorized: false } : false
 });
 
-// Create tables
-function createTables() {
-  db.serialize(() => {
+// Initialize PostgreSQL Database
+async function initDb() {
+  try {
     // Users table
-    db.run(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        name TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        password VARCHAR(255) NOT NULL,
+        name VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
     // Expenses table with local_id to map back to Room DB IDs
-    db.run(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS expenses (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         local_id INTEGER NOT NULL,
-        merchant TEXT NOT NULL,
-        amount REAL NOT NULL,
-        timestamp INTEGER NOT NULL,
-        category TEXT NOT NULL,
-        payment_method TEXT NOT NULL,
+        merchant VARCHAR(255) NOT NULL,
+        amount DOUBLE PRECISION NOT NULL,
+        timestamp BIGINT NOT NULL,
+        category VARCHAR(255) NOT NULL,
+        payment_method VARCHAR(255) NOT NULL,
         is_simulated INTEGER DEFAULT 0,
-        sms_sender TEXT,
+        sms_sender VARCHAR(255),
         notes TEXT,
         raw_sms_text TEXT,
-        updated_at INTEGER NOT NULL,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        updated_at BIGINT NOT NULL,
         UNIQUE(user_id, local_id)
       )
     `);
 
     // Budgets table
-    db.run(`
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS budgets (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         local_id INTEGER NOT NULL,
-        name TEXT NOT NULL,
+        name VARCHAR(255) NOT NULL,
         is_category INTEGER DEFAULT 0,
-        category_name TEXT,
-        amount REAL NOT NULL,
-        timestamp INTEGER NOT NULL,
-        updated_at INTEGER NOT NULL,
-        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+        category_name VARCHAR(255),
+        amount DOUBLE PRECISION NOT NULL,
+        timestamp BIGINT NOT NULL,
+        updated_at BIGINT NOT NULL,
         UNIQUE(user_id, local_id)
       )
     `);
 
-    console.log('Successfully configured SQLite schemas for Users, Expenses, and Budgets.');
-  });
+    console.log('Successfully configured PostgreSQL schemas for Users, Expenses, and Budgets.');
+  } catch (err) {
+    console.error('Error configuring database schemas:', err.message);
+    process.exit(1);
+  }
 }
+
+initDb();
 
 // Authentication Middleware
 function authenticateToken(req, res, next) {
@@ -102,380 +106,258 @@ function authenticateToken(req, res, next) {
 // --- AUTH API ENDPOINTS ---
 
 // Register
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   const { email, password, name } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
 
-  const saltRounds = 10;
-  bcrypt.hash(password, saltRounds, (err, hashedPassword) => {
-    if (err) {
-      return res.status(500).json({ error: 'Encryption failed.' });
-    }
+  try {
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    const query = `INSERT INTO users (email, password, name) VALUES (?, ?, ?)`;
-    db.run(query, [email, hashedPassword, name || 'User'], function (err) {
-      if (err) {
-        if (err.message.includes('UNIQUE constraint failed')) {
-          return res.status(400).json({ error: 'An account with this email already exists.' });
-        }
-        return res.status(500).json({ error: 'Database signup failed: ' + err.message });
-      }
+    const query = `INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id`;
+    const result = await pool.query(query, [email, hashedPassword, name || 'User']);
+    const userId = result.rows[0].id;
 
-      const token = jwt.sign({ id: this.lastID, email, name: name || 'User' }, JWT_SECRET, { expiresIn: '30d' });
-      res.status(201).json({
-        message: 'Registration successful!',
-        token,
-        user: { id: this.lastID, email, name: name || 'User' }
-      });
+    const token = jwt.sign({ id: userId, email, name: name || 'User' }, JWT_SECRET, { expiresIn: '30d' });
+    return res.status(201).json({
+      message: 'Registration successful!',
+      token,
+      user: { id: userId, email, name: name || 'User' }
     });
-  });
+  } catch (err) {
+    if (err.code === '23505') { // PostgreSQL unique_violation
+      return res.status(400).json({ error: 'An account with this email already exists.' });
+    }
+    return res.status(500).json({ error: 'Database signup failed: ' + err.message });
+  }
 });
 
 // Login
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
 
-  db.get(`SELECT * FROM users WHERE email = ?`, [email], (err, user) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database authentication error.' });
-    }
+  try {
+    const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
+    const user = result.rows[0];
+
     if (!user) {
       return res.status(400).json({ error: 'No account registered with this email.' });
     }
 
-    bcrypt.compare(password, user.password, (err, isMatch) => {
-      if (err) {
-        return res.status(500).json({ error: 'Decryption failed.' });
-      }
-      if (!isMatch) {
-        return res.status(400).json({ error: 'Incorrect passcode/password.' });
-      }
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Incorrect passcode/password.' });
+    }
 
-      const token = jwt.sign({ id: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '30d' });
-      res.json({
-        message: 'Login successful!',
-        token,
-        user: { id: user.id, email: user.email, name: user.name }
-      });
+    const token = jwt.sign({ id: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '30d' });
+    return res.json({
+      message: 'Login successful!',
+      token,
+      user: { id: user.id, email: user.email, name: user.name }
     });
-  });
+  } catch (err) {
+    return res.status(500).json({ error: 'Database authentication error: ' + err.message });
+  }
 });
 
 // Profile status check
-app.get('/api/auth/me', authenticateToken, (req, res) => {
-  db.get(`SELECT id, email, name, created_at FROM users WHERE id = ?`, [req.user.id], (err, user) => {
-    if (err || !user) {
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const result = await pool.query(`SELECT id, email, name, created_at FROM users WHERE id = $1`, [req.user.id]);
+    const user = result.rows[0];
+    if (!user) {
       return res.status(404).json({ error: 'User profiles not found.' });
     }
-    res.json(user);
-  });
+    return res.json(user);
+  } catch (err) {
+    return res.status(500).json({ error: 'Database error: ' + err.message });
+  }
 });
 
 
 // --- REAL-TIME DATA SYNCHRONIZATION API ---
 
 // Unified Sync Endpoint
-app.post('/api/sync', authenticateToken, (req, res) => {
+app.post('/api/sync', authenticateToken, async (req, res) => {
   const userId = req.user.id;
   const { expenses = [], budgets = [] } = req.body;
 
   console.log(`Sync requested for User ID: ${userId}. Incoming items: ${expenses.length} expenses, ${budgets.length} budgets.`);
-
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
-
-    try {
-      // 1. Process Expenses
-      const expenseStmt = db.prepare(`
-        INSERT INTO expenses (
-          user_id, local_id, merchant, amount, timestamp, category, payment_method, is_simulated, sms_sender, notes, raw_sms_text, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, local_id) DO UPDATE SET
-          merchant = excluded.merchant,
-          amount = excluded.amount,
-          timestamp = excluded.timestamp,
-          category = excluded.category,
-          payment_method = excluded.payment_method,
-          is_simulated = excluded.is_simulated,
-          sms_sender = excluded.sms_sender,
-          notes = excluded.notes,
-          raw_sms_text = excluded.raw_sms_text,
-          updated_at = excluded.updated_at
-        WHERE excluded.updated_at > expenses.updated_at
-      `);
-
-      expenses.forEach(exp => {
-        expenseStmt.run([
-          userId,
-          exp.id, // mapped local id
-          exp.merchant,
-          exp.amount,
-          exp.timestamp,
-          exp.category,
-          exp.paymentMethod,
-          exp.isSimulated ? 1 : 0,
-          exp.smsSender || null,
-          exp.notes || '',
-          exp.rawSmsText || null,
-          exp.timestamp // use timestamp or current time as updated_at
-        ]);
-      });
-      expenseStmt.finalize();
-
-      // 2. Process Budgets
-      const budgetStmt = db.prepare(`
-        INSERT INTO budgets (
-          user_id, local_id, name, is_category, category_name, amount, timestamp, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, local_id) DO UPDATE SET
-          name = excluded.name,
-          is_category = excluded.is_category,
-          category_name = excluded.category_name,
-          amount = excluded.amount,
-          timestamp = excluded.timestamp,
-          updated_at = excluded.updated_at
-        WHERE excluded.updated_at > budgets.updated_at
-      `);
-
-      budgets.forEach(bud => {
-        budgetStmt.run([
-          userId,
-          bud.id, // mapped local id
-          bud.name,
-          bud.isCategory ? 1 : 0,
-          bud.categoryName || null,
-          bud.amount,
-          bud.timestamp,
-          bud.timestamp
-        ]);
-      });
-      budgetStmt.finalize();
-
-      db.run('COMMIT', (err) => {
-        if (err) {
-          console.error('Commit failed, rolling back:', err);
-          db.run('ROLLBACK');
-          return res.status(500).json({ error: 'Sync transaction failed to commit.' });
-        }
-
-        // Fetch back updated dataset to return to client
-        db.all(`SELECT * FROM expenses WHERE user_id = ?`, [userId], (err, allExpenses) => {
-          if (err) return res.status(500).json({ error: 'Failed to retrieve synced expenses.' });
-
-          db.all(`SELECT * FROM budgets WHERE user_id = ?`, [userId], (err, allBudgets) => {
-            if (err) return res.status(500).json({ error: 'Failed to retrieve synced budgets.' });
-
-            // Format appropriately for Jetpack Compose models
-            const formattedExpenses = allExpenses.map(exp => ({
-              id: exp.local_id, // map back to client's local room ID
-              merchant: exp.merchant,
-              amount: exp.amount,
-              timestamp: exp.timestamp,
-              category: exp.category,
-              paymentMethod: exp.payment_method,
-              isSimulated: exp.is_simulated === 1,
-              smsSender: exp.sms_sender,
-              notes: exp.notes || '',
-              rawSmsText: exp.raw_sms_text
-            }));
-
-            const formattedBudgets = allBudgets.map(bud => ({
-              id: bud.local_id, // map back to client's local room ID
-              name: bud.name,
-              isCategory: bud.is_category === 1,
-              categoryName: bud.category_name,
-              amount: bud.amount,
-              timestamp: bud.timestamp
-            }));
-
-            res.json({
-              message: 'Sync completed successfully!',
-              timestamp: Date.now(),
-              expenses: formattedExpenses,
-              budgets: formattedBudgets
-            });
-          });
-        });
-      });
-
-    } catch (e) {
-      console.error('Exception during transaction sync, rolling back:', e);
-      db.run('ROLLBACK');
-      res.status(500).json({ error: 'Sync server fatal error: ' + e.message });
-    }
-  });
+  await runSyncForUser(userId, expenses, budgets, res);
 });
 
 // Anonymous / Accountless Sync Endpoint based on unique device identifier
-app.post('/api/sync/anonymous', (req, res) => {
+app.post('/api/sync/anonymous', async (req, res) => {
   const { deviceId, expenses = [], budgets = [] } = req.body;
 
   if (!deviceId) {
     return res.status(400).json({ error: 'Device ID is required for anonymous sync.' });
   }
 
-  // Find or create anonymous user for this device ID
-  db.get(`SELECT * FROM users WHERE email = ?`, [deviceId], (err, user) => {
-    if (err) {
-      return res.status(500).json({ error: 'Database search error: ' + err.message });
-    }
+  try {
+    // Find or create anonymous user for this device ID
+    const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [deviceId]);
+    const user = result.rows[0];
 
     if (user) {
-      runSyncForUser(user.id, expenses, budgets, res);
+      await runSyncForUser(user.id, expenses, budgets, res);
     } else {
       // Create new virtual anonymous user
-      db.run(`INSERT INTO users (email, password, name) VALUES (?, ?, ?)`, [deviceId, 'anonymous_pass', 'Device ' + deviceId], function (err) {
-        if (err) {
-          return res.status(500).json({ error: 'Database anonymous user registration failed: ' + err.message });
-        }
-        runSyncForUser(this.lastID, expenses, budgets, res);
-      });
+      const insertResult = await pool.query(
+        `INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id`,
+        [deviceId, 'anonymous_pass', 'Device ' + deviceId]
+      );
+      await runSyncForUser(insertResult.rows[0].id, expenses, budgets, res);
     }
-  });
+  } catch (err) {
+    return res.status(500).json({ error: 'Database anonymous user registration failed: ' + err.message });
+  }
 });
 
-function runSyncForUser(userId, expenses, budgets, res) {
-  db.serialize(() => {
-    db.run('BEGIN TRANSACTION');
+async function runSyncForUser(userId, expenses, budgets, res) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-    try {
-      // 1. Process Expenses
-      const expenseStmt = db.prepare(`
-        INSERT INTO expenses (
-          user_id, local_id, merchant, amount, timestamp, category, payment_method, is_simulated, sms_sender, notes, raw_sms_text, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, local_id) DO UPDATE SET
-          merchant = excluded.merchant,
-          amount = excluded.amount,
-          timestamp = excluded.timestamp,
-          category = excluded.category,
-          payment_method = excluded.payment_method,
-          is_simulated = excluded.is_simulated,
-          sms_sender = excluded.sms_sender,
-          notes = excluded.notes,
-          raw_sms_text = excluded.raw_sms_text,
-          updated_at = excluded.updated_at
-        WHERE excluded.updated_at > expenses.updated_at
-      `);
+    // 1. Process Expenses
+    const expenseQuery = `
+      INSERT INTO expenses (
+        user_id, local_id, merchant, amount, timestamp, category, payment_method, is_simulated, sms_sender, notes, raw_sms_text, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      ON CONFLICT(user_id, local_id) DO UPDATE SET
+        merchant = excluded.merchant,
+        amount = excluded.amount,
+        timestamp = excluded.timestamp,
+        category = excluded.category,
+        payment_method = excluded.payment_method,
+        is_simulated = excluded.is_simulated,
+        sms_sender = excluded.sms_sender,
+        notes = excluded.notes,
+        raw_sms_text = excluded.raw_sms_text,
+        updated_at = excluded.updated_at
+      WHERE excluded.updated_at > expenses.updated_at
+    `;
 
-      expenses.forEach(exp => {
-        expenseStmt.run([
-          userId,
-          exp.id, // mapped local id
-          exp.merchant,
-          exp.amount,
-          exp.timestamp,
-          exp.category,
-          exp.paymentMethod,
-          exp.isSimulated ? 1 : 0,
-          exp.smsSender || null,
-          exp.notes || '',
-          exp.rawSmsText || null,
-          exp.timestamp // use timestamp or current time as updated_at
-        ]);
-      });
-      expenseStmt.finalize();
-
-      // 2. Process Budgets
-      const budgetStmt = db.prepare(`
-        INSERT INTO budgets (
-          user_id, local_id, name, is_category, category_name, amount, timestamp, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, local_id) DO UPDATE SET
-          name = excluded.name,
-          is_category = excluded.is_category,
-          category_name = excluded.category_name,
-          amount = excluded.amount,
-          timestamp = excluded.timestamp,
-          updated_at = excluded.updated_at
-        WHERE excluded.updated_at > budgets.updated_at
-      `);
-
-      budgets.forEach(bud => {
-        budgetStmt.run([
-          userId,
-          bud.id, // mapped local id
-          bud.name,
-          bud.isCategory ? 1 : 0,
-          bud.categoryName || null,
-          bud.amount,
-          bud.timestamp,
-          bud.timestamp
-        ]);
-      });
-      budgetStmt.finalize();
-
-      db.run('COMMIT', (err) => {
-        if (err) {
-          console.error('Commit failed, rolling back:', err);
-          db.run('ROLLBACK');
-          return res.status(500).json({ error: 'Sync transaction failed to commit.' });
-        }
-
-        // Fetch back updated dataset to return to client
-        db.all(`SELECT * FROM expenses WHERE user_id = ?`, [userId], (err, allExpenses) => {
-          if (err) return res.status(500).json({ error: 'Failed to retrieve synced expenses.' });
-
-          db.all(`SELECT * FROM budgets WHERE user_id = ?`, [userId], (err, allBudgets) => {
-            if (err) return res.status(500).json({ error: 'Failed to retrieve synced budgets.' });
-
-            // Format appropriately for Jetpack Compose models
-            const formattedExpenses = allExpenses.map(exp => ({
-              id: exp.local_id, // map back to client's local room ID
-              merchant: exp.merchant,
-              amount: exp.amount,
-              timestamp: exp.timestamp,
-              category: exp.category,
-              paymentMethod: exp.payment_method,
-              isSimulated: exp.is_simulated === 1,
-              smsSender: exp.sms_sender,
-              notes: exp.notes || '',
-              rawSmsText: exp.raw_sms_text
-            }));
-
-            const formattedBudgets = allBudgets.map(bud => ({
-              id: bud.local_id, // map back to client's local room ID
-              name: bud.name,
-              isCategory: bud.is_category === 1,
-              categoryName: bud.category_name,
-              amount: bud.amount,
-              timestamp: bud.timestamp
-            }));
-
-            res.json({
-              message: 'Sync completed successfully!',
-              timestamp: Date.now(),
-              expenses: formattedExpenses,
-              budgets: formattedBudgets
-            });
-          });
-        });
-      });
-
-    } catch (e) {
-      console.error('Exception during transaction sync, rolling back:', e);
-      db.run('ROLLBACK');
-      res.status(500).json({ error: 'Sync server fatal error: ' + e.message });
+    for (const exp of expenses) {
+      await client.query(expenseQuery, [
+        userId,
+        exp.id, // mapped local id
+        exp.merchant,
+        exp.amount,
+        exp.timestamp,
+        exp.category,
+        exp.paymentMethod,
+        exp.isSimulated ? 1 : 0,
+        exp.smsSender || null,
+        exp.notes || '',
+        exp.rawSmsText || null,
+        exp.timestamp // use timestamp as updated_at
+      ]);
     }
-  });
+
+    // 2. Process Budgets
+    const budgetQuery = `
+      INSERT INTO budgets (
+        user_id, local_id, name, is_category, category_name, amount, timestamp, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT(user_id, local_id) DO UPDATE SET
+        name = excluded.name,
+        is_category = excluded.is_category,
+        category_name = excluded.category_name,
+        amount = excluded.amount,
+        timestamp = excluded.timestamp,
+        updated_at = excluded.updated_at
+      WHERE excluded.updated_at > budgets.updated_at
+    `;
+
+    for (const bud of budgets) {
+      await client.query(budgetQuery, [
+        userId,
+        bud.id, // mapped local id
+        bud.name,
+        bud.isCategory ? 1 : 0,
+        bud.categoryName || null,
+        bud.amount,
+        bud.timestamp,
+        bud.timestamp
+      ]);
+    }
+
+    await client.query('COMMIT');
+
+    // Fetch back updated dataset to return to client
+    const expensesRes = await client.query(`SELECT * FROM expenses WHERE user_id = $1`, [userId]);
+    const budgetsRes = await client.query(`SELECT * FROM budgets WHERE user_id = $1`, [userId]);
+
+    // Format appropriately for Jetpack Compose models
+    const formattedExpenses = expensesRes.rows.map(exp => ({
+      id: typeof exp.local_id === 'string' ? parseInt(exp.local_id, 10) : exp.local_id,
+      merchant: exp.merchant,
+      amount: typeof exp.amount === 'string' ? parseFloat(exp.amount) : exp.amount,
+      timestamp: typeof exp.timestamp === 'string' ? parseInt(exp.timestamp, 10) : exp.timestamp,
+      category: exp.category,
+      paymentMethod: exp.payment_method,
+      isSimulated: exp.is_simulated === 1,
+      smsSender: exp.sms_sender,
+      notes: exp.notes || '',
+      rawSmsText: exp.raw_sms_text
+    }));
+
+    const formattedBudgets = budgetsRes.rows.map(bud => ({
+      id: typeof bud.local_id === 'string' ? parseInt(bud.local_id, 10) : bud.local_id,
+      name: bud.name,
+      isCategory: bud.is_category === 1,
+      categoryName: bud.category_name,
+      amount: typeof bud.amount === 'string' ? parseFloat(bud.amount) : bud.amount,
+      timestamp: typeof bud.timestamp === 'string' ? parseInt(bud.timestamp, 10) : bud.timestamp
+    }));
+
+    return res.json({
+      message: 'Sync completed successfully!',
+      timestamp: Date.now(),
+      expenses: formattedExpenses,
+      budgets: formattedBudgets
+    });
+
+  } catch (e) {
+    console.error('Exception during transaction sync, rolling back:', e);
+    try {
+      await client.query('ROLLBACK');
+    } catch (rollbackErr) {
+      console.error('Rollback failed:', rollbackErr);
+    }
+    return res.status(500).json({ error: 'Sync server fatal error: ' + e.message });
+  } finally {
+    client.release();
+  }
 }
 
 
 // App health status check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'online',
-    serverTime: new Date().toISOString(),
-    database: 'SQLite - Connected',
-    appName: 'Lekkal Finance API Gateway'
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    return res.json({
+      status: 'online',
+      serverTime: new Date().toISOString(),
+      database: 'PostgreSQL - Connected',
+      appName: 'Lekkal Finance API Gateway'
+    });
+  } catch (err) {
+    return res.status(500).json({
+      status: 'error',
+      serverTime: new Date().toISOString(),
+      database: 'PostgreSQL - Connection Failed: ' + err.message,
+      appName: 'Lekkal Finance API Gateway'
+    });
+  }
 });
 
 // Serve backup instructions as a simple UI on root
@@ -496,7 +378,7 @@ app.get('/', (req, res) => {
         <div class="container">
           <h1>Lekkal Backend Server <span class="status">ONLINE</span></h1>
           <p>Lekkal's fully functional database-connected cloud sync gateway is running successfully!</p>
-          <p>This backend utilizes <strong>Express.js</strong> and a local, secure <strong>SQLite</strong> database for seamless local and multi-device backups.</p>
+          <p>This backend utilizes <strong>Express.js</strong> and a secure <strong>PostgreSQL</strong> database for seamless local and multi-device backups.</p>
           <h3>Active Sync Routes</h3>
           <ul>
             <li><code>POST /api/auth/register</code> - Register accounts</li>
