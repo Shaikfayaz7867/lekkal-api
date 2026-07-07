@@ -360,6 +360,43 @@ app.get('/api/health', async (req, res) => {
   }
 });
 
+// --- DATA RETRIEVAL API ---
+
+// Get all expenses with optional filters
+app.get('/api/expenses', authenticateToken, async (req, res) => {
+  const userId = req.user.id;
+  const { merchant, category, minAmount, maxAmount } = req.query;
+
+  try {
+    let query = `SELECT * FROM expenses WHERE user_id = $1`;
+    const params = [userId];
+
+    if (merchant) {
+      params.push(`%${merchant}%`);
+      query += ` AND merchant ILIKE $${params.length}`;
+    }
+    if (category) {
+      params.push(category);
+      query += ` AND category = $${params.length}`;
+    }
+    if (minAmount) {
+      params.push(parseFloat(minAmount));
+      query += ` AND amount >= $${params.length}`;
+    }
+    if (maxAmount) {
+      params.push(parseFloat(maxAmount));
+      query += ` AND amount <= $${params.length}`;
+    }
+
+    query += ` ORDER BY timestamp DESC`;
+
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch expenses: ' + err.message });
+  }
+});
+
 // Serve backup instructions as a simple UI on root
 app.get('/', (req, res) => {
   res.send(`
