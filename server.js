@@ -362,12 +362,22 @@ app.get('/api/health', async (req, res) => {
 
 // --- DATA RETRIEVAL API ---
 
-// Get all expenses with optional filters
-app.get('/api/expenses', authenticateToken, async (req, res) => {
-  const userId = req.user.id;
-  const { merchant, category, minAmount, maxAmount } = req.query;
+// Get all expenses with pagination and optional filters
+app.get('/api/expenses', async (req, res) => {
+  const { deviceId, merchant, category, minAmount, maxAmount, page = 1, limit = 20 } = req.query;
+
+  if (!deviceId) {
+    return res.status(400).json({ error: 'Device ID is required.' });
+  }
 
   try {
+    // Find virtual anonymous user
+    const userRes = await pool.query(`SELECT id FROM users WHERE email = $1`, [deviceId]);
+    if (userRes.rows.length === 0) {
+      return res.json([]); // No user, no expenses
+    }
+    const userId = userRes.rows[0].id;
+
     let query = `SELECT * FROM expenses WHERE user_id = $1`;
     const params = [userId];
 
@@ -390,10 +400,87 @@ app.get('/api/expenses', authenticateToken, async (req, res) => {
 
     query += ` ORDER BY timestamp DESC`;
 
+    // Pagination
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+    params.push(parseInt(limit));
+    query += ` LIMIT $${params.length}`;
+    params.push(offset);
+    query += ` OFFSET $${params.length}`;
+
     const result = await pool.query(query, params);
-    res.json(result.rows);
+
+    // Format appropriately for Jetpack Compose models
+    const formattedExpenses = result.rows.map(exp => ({
+      id: typeof exp.local_id === 'string' ? parseInt(exp.local_id, 10) : exp.local_id,
+      merchant: exp.merchant,
+      amount: typeof exp.amount === 'string' ? parseFloat(exp.amount) : exp.amount,
+      timestamp: typeof exp.timestamp === 'string' ? parseInt(exp.timestamp, 10) : exp.timestamp,
+      category: exp.category,
+      paymentMethod: exp.payment_method,
+      isSimulated: exp.is_simulated === 1,
+      smsSender: exp.sms_sender,
+      notes: exp.notes || '',
+      rawSmsText: exp.raw_sms_text
+    }));
+
+    res.json(formattedExpenses);
   } catch (err) {
     res.status(500).json({ error: 'Failed to fetch expenses: ' + err.message });
+  }
+});
+
+// Individual CRUD endpoints for immediate interaction
+app.post('/api/expenses', async (req, res) => {
+  const { deviceId, expense } = req.body;
+  if (!deviceId || !expense) return res.status(400).json({ error: 'Missing deviceId or expense data' });
+
+  try {
+    const userRes = await pool.query(`SELECT id FROM users WHERE email = $1`, [deviceId]);
+    let userId;
+    if (userRes.rows.length === 0) {
+        const insertUser = await pool.query(`INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id`, [deviceId, 'anonymous_pass', 'Device ' + deviceId]);
+        userId = insertUser.rows[0].id;
+    } else {
+        userId = userRes.rows[0].id;
+    }
+
+    const query = `
+      INSERT INTO expenses (
+        user_id, local_id, merchant, amount, timestamp, category, payment_method, is_simulated, sms_sender, notes, raw_sms_text, updated_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      ON CONFLICT(user_id, local_id) DO UPDATE SET
+        merchant = excluded.merchant,
+        amount = excluded.amount,
+        timestamp = excluded.timestamp,
+        category = excluded.category,
+        payment_method = excluded.payment_method,
+        updated_at = excluded.updated_at
+      RETURNING *
+    `;
+    await pool.query(query, [
+      userId, expense.id, expense.merchant, expense.amount, expense.timestamp,
+      expense.category, expense.paymentMethod, expense.isSimulated ? 1 : 0,
+      expense.smsSender || null, expense.notes || '', expense.rawSmsText || null, Date.now()
+    ]);
+    res.json({ message: 'Expense saved successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/expenses/:localId', async (req, res) => {
+  const { deviceId } = req.query;
+  const { localId } = req.params;
+  if (!deviceId) return res.status(400).json({ error: 'Device ID required' });
+
+  try {
+    const userRes = await pool.query(`SELECT id FROM users WHERE email = $1`, [deviceId]);
+    if (userRes.rows.length === 0) return res.status(404).json({ error: 'User not found' });
+
+    await pool.query(`DELETE FROM expenses WHERE user_id = $1 AND local_id = $2`, [userRes.rows[0].id, localId]);
+    res.json({ message: 'Expense deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
