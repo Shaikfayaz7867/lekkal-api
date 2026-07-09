@@ -364,7 +364,7 @@ app.get('/api/health', async (req, res) => {
 
 // Get all expenses with pagination and optional filters
 app.get('/api/expenses', async (req, res) => {
-  const { deviceId, merchant, category, minAmount, maxAmount, page = 1, limit = 20 } = req.query;
+  const { deviceId, merchant, category, date, minAmount, maxAmount, page = 1, limit = 20 } = req.query;
 
   if (!deviceId) {
     return res.status(400).json({ error: 'Device ID is required.' });
@@ -388,6 +388,16 @@ app.get('/api/expenses', async (req, res) => {
     if (category) {
       params.push(category);
       query += ` AND category = $${params.length}`;
+    }
+    if (date) {
+      // Assuming date is in YYYY-MM-DD format
+      const startOfDay = new Date(date).getTime();
+      const endOfDay = startOfDay + (24 * 60 * 60 * 1000) - 1;
+
+      params.push(startOfDay);
+      query += ` AND timestamp >= $${params.length}`;
+      params.push(endOfDay);
+      query += ` AND timestamp <= $${params.length}`;
     }
     if (minAmount) {
       params.push(parseFloat(minAmount));
