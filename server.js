@@ -107,10 +107,10 @@ function authenticateToken(req, res, next) {
 
 // Register
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, name } = req.body;
+  const { username, password, name } = req.body;
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required.' });
   }
 
   try {
@@ -118,18 +118,18 @@ app.post('/api/auth/register', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
     const query = `INSERT INTO users (email, password, name) VALUES ($1, $2, $3) RETURNING id`;
-    const result = await pool.query(query, [email, hashedPassword, name || 'User']);
+    const result = await pool.query(query, [username, hashedPassword, name || 'User']);
     const userId = result.rows[0].id;
 
-    const token = jwt.sign({ id: userId, email, name: name || 'User' }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: userId, username, name: name || 'User' }, JWT_SECRET, { expiresIn: '30d' });
     return res.status(201).json({
       message: 'Registration successful!',
       token,
-      user: { id: userId, email, name: name || 'User' }
+      user: { id: userId, username, name: name || 'User' }
     });
   } catch (err) {
     if (err.code === '23505') { // PostgreSQL unique_violation
-      return res.status(400).json({ error: 'An account with this email already exists.' });
+      return res.status(400).json({ error: 'This username is already taken.' });
     }
     return res.status(500).json({ error: 'Database signup failed: ' + err.message });
   }
@@ -137,40 +137,65 @@ app.post('/api/auth/register', async (req, res) => {
 
 // Login
 app.post('/api/auth/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { username, password } = req.body;
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+  if (!username || !password) {
+    return res.status(400).json({ error: 'Username and password are required.' });
   }
 
   try {
-    const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [email]);
+    const result = await pool.query(`SELECT * FROM users WHERE email = $1`, [username]);
     const user = result.rows[0];
 
     if (!user) {
-      return res.status(400).json({ error: 'No account registered with this email.' });
+      return res.status(400).json({ error: 'No account registered with this username.' });
     }
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
-      return res.status(400).json({ error: 'Incorrect passcode/password.' });
+      return res.status(400).json({ error: 'Incorrect password.' });
     }
 
-    const token = jwt.sign({ id: user.id, email: user.email, name: user.name }, JWT_SECRET, { expiresIn: '30d' });
+    const token = jwt.sign({ id: user.id, username: user.email, name: user.name }, JWT_SECRET, { expiresIn: '30d' });
     return res.json({
       message: 'Login successful!',
       token,
-      user: { id: user.id, email: user.email, name: user.name }
+      user: { id: user.id, username: user.email, name: user.name }
     });
   } catch (err) {
     return res.status(500).json({ error: 'Database authentication error: ' + err.message });
   }
 });
 
+// Reset Password
+app.post('/api/auth/reset-password', async (req, res) => {
+  const { username, newPassword } = req.body;
+
+  if (!username || !newPassword) {
+    return res.status(400).json({ error: 'Username and new password are required.' });
+  }
+
+  try {
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    const query = `UPDATE users SET password = $1 WHERE email = $2`;
+    const result = await pool.query(query, [hashedPassword, username]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: 'No account found with that username.' });
+    }
+
+    return res.json({ message: 'Password reset successfully!' });
+  } catch (err) {
+    return res.status(500).json({ error: 'Database update failed: ' + err.message });
+  }
+});
+
 // Profile status check
 app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id, email, name, created_at FROM users WHERE id = $1`, [req.user.id]);
+    const result = await pool.query(`SELECT id, email as username, name, created_at FROM users WHERE id = $1`, [req.user.id]);
     const user = result.rows[0];
     if (!user) {
       return res.status(404).json({ error: 'User profiles not found.' });
